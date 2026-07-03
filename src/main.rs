@@ -5,10 +5,12 @@ mod error;
 mod events;
 mod git;
 mod github;
+mod jj;
 mod keybindings;
 mod pty;
 mod state;
 mod ui;
+mod vcs;
 
 use std::panic;
 use anyhow::{Context, Result};

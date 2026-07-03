@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use crate::config::RepoConfig;
 use crate::keybindings::Keybindings;
+use crate::vcs::VcsBackend;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -140,6 +141,7 @@ pub struct Repository {
     pub display_name: String,
     pub worktrees: Vec<Worktree>,
     pub is_expanded: bool,
+    pub backend: VcsBackend,
 }
 
 impl Repository {
@@ -159,6 +161,7 @@ impl Repository {
             display_name,
             worktrees: vec![],
             is_expanded: true,
+            backend: VcsBackend::Git,
         }
     }
 }
