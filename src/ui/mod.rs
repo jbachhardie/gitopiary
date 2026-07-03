@@ -76,7 +76,7 @@ fn build_status_hints(kb: &crate::keybindings::Keybindings) -> Vec<String> {
     let action_labels = [
         (Action::FocusTerminal, "terminal"),
         (Action::UnfocusTerminal, "unfocus"),
-        (Action::OpenEditor, "zed"),
+        (Action::OpenEditor, "smerge"),
         (Action::NewWorktree, "new"),
         (Action::DeleteWorktree, "delete"),
         (Action::AddRepo, "add repo"),

@@ -488,7 +488,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender<AppEvent>)
         Action::OpenEditor => {
             if let Some(wt) = app.state.selected_worktree() {
                 let path = wt.path.clone();
-                std::process::Command::new("zed")
+                std::process::Command::new("smerge")
                     .arg(&path)
                     .spawn()
                     .ok();
