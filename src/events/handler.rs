@@ -345,6 +345,8 @@ fn handle_delete_dialog_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender<A
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             let repo_path = dialog.repo_path.clone();
             let worktree_path = dialog.worktree_path.clone();
+            let backend = dialog.backend;
+            let workspace_name = dialog.workspace_name.clone();
 
             if let Some(d) = app.state.delete_worktree_dialog.as_mut() {
                 d.is_deleting = true;
@@ -355,7 +357,7 @@ fn handle_delete_dialog_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender<A
 
             let tx = tx.clone();
             tokio::spawn(async move {
-                let result = crate::git::worktree::remove_worktree(&repo_path, &worktree_path).await;
+                let result = crate::vcs::remove_workspace(backend, &repo_path, &worktree_path, &workspace_name).await;
                 match result {
                     Ok(()) => {
                         tx.send(AppEvent::WorktreeDeleted { repo_path, worktree_path }).ok();
@@ -478,8 +480,8 @@ fn handle_list_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender<AppEvent>)
         }
         Action::NewWorktree => {
             let repo_idx = app.state.selected_repo_idx;
-            if !app.state.repos.is_empty() {
-                app.state.new_worktree_dialog = Some(NewWorktreeDialog::new(repo_idx));
+            if let Some(repo) = app.state.repos.get(repo_idx) {
+                app.state.new_worktree_dialog = Some(NewWorktreeDialog::new(repo_idx, repo.backend));
             }
         }
         Action::AddRepo => {
@@ -509,6 +511,8 @@ fn handle_list_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender<AppEvent>)
                         repo_path: repo.config.path.clone(),
                         worktree_path: wt.path.clone(),
                         branch_name: wt.branch.clone(),
+                        backend: repo.backend,
+                        workspace_name: wt.name.clone(),
                         is_deleting: false,
                         error: None,
                     });

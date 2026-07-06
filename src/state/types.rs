@@ -203,6 +203,7 @@ pub enum PrState {
 #[derive(Debug, Clone)]
 pub struct NewWorktreeDialog {
     pub repo_idx: usize,
+    pub backend: VcsBackend,
     pub branch_name: String,
     pub cursor_pos: usize,
     pub error: Option<String>,
@@ -210,9 +211,10 @@ pub struct NewWorktreeDialog {
 }
 
 impl NewWorktreeDialog {
-    pub fn new(repo_idx: usize) -> Self {
+    pub fn new(repo_idx: usize, backend: VcsBackend) -> Self {
         Self {
             repo_idx,
+            backend,
             branch_name: String::new(),
             cursor_pos: 0,
             error: None,
@@ -257,6 +259,8 @@ pub struct DeleteWorktreeDialog {
     pub repo_path: PathBuf,
     pub worktree_path: PathBuf,
     pub branch_name: String,
+    pub backend: VcsBackend,
+    pub workspace_name: String,
     pub is_deleting: bool,
     pub error: Option<String>,
 }

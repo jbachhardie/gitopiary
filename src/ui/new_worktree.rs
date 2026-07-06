@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 use crate::state::types::NewWorktreeDialog;
+use crate::vcs::VcsBackend;
 
 pub fn render_new_worktree_dialog(
     frame: &mut Frame,
@@ -28,8 +29,12 @@ pub fn render_new_worktree_dialog(
     // Clear background
     frame.render_widget(Clear, dialog_area);
 
+    let title = match dialog.backend {
+        VcsBackend::Jj => " New Workspace ",
+        VcsBackend::Git => " New Worktree ",
+    };
     let block = Block::default()
-        .title(" New Worktree ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -47,7 +52,11 @@ pub fn render_new_worktree_dialog(
     };
 
     // Label
-    let label = Paragraph::new("Branch name:");
+    let label_text = match dialog.backend {
+        VcsBackend::Jj => "Workspace name:",
+        VcsBackend::Git => "Branch name:",
+    };
+    let label = Paragraph::new(label_text);
     frame.render_widget(label, label_area);
 
     // Input field

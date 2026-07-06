@@ -123,10 +123,11 @@ async fn load_repo_streaming(config: RepoConfig, tx: UnboundedSender<AppEvent>) 
 
 pub async fn create_worktree(
     repo_path: PathBuf,
-    branch_name: String,
+    name: String,
     tx: UnboundedSender<AppEvent>,
 ) {
-    let result = crate::git::worktree::create_worktree(&repo_path, &branch_name).await;
+    let backend = vcs::detect_backend(&repo_path);
+    let result = vcs::create_workspace(backend, &repo_path, &name).await;
     match result {
         Ok(worktree_path) => {
             tx.send(AppEvent::WorktreeCreated { repo_path, worktree_path }).ok();

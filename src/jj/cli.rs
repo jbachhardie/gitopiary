@@ -29,3 +29,14 @@ pub fn run_jj(args: &[&str]) -> Result<String> {
         .map_err(|e| friendly_spawn_error(args, e))?;
     finish(args, output)
 }
+
+/// Run `jj` asynchronously. Use from async contexts (e.g. spawned via
+/// `tokio::spawn`, mirroring `git::worktree`'s use of `tokio::process::Command`).
+pub async fn run_jj_async(args: &[&str]) -> Result<String> {
+    let output = tokio::process::Command::new("jj")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| friendly_spawn_error(args, e))?;
+    finish(args, output)
+}

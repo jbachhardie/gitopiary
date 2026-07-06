@@ -48,6 +48,25 @@ pub fn load_worktree_info(backend: VcsBackend, source: WorktreeSource) -> Result
     }
 }
 
+pub async fn create_workspace(backend: VcsBackend, repo_path: &PathBuf, name: &str) -> Result<PathBuf> {
+    match backend {
+        VcsBackend::Git => crate::git::worktree::create_worktree(repo_path, name).await,
+        VcsBackend::Jj => crate::jj::worktree::create_workspace(repo_path, name).await,
+    }
+}
+
+pub async fn remove_workspace(
+    backend: VcsBackend,
+    repo_path: &PathBuf,
+    workspace_path: &PathBuf,
+    name: &str,
+) -> Result<()> {
+    match backend {
+        VcsBackend::Git => crate::git::worktree::remove_worktree(repo_path, workspace_path).await,
+        VcsBackend::Jj => crate::jj::worktree::remove_workspace(repo_path, workspace_path, name).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 use crate::state::types::DeleteWorktreeDialog;
+use crate::vcs::VcsBackend;
 
 pub fn render_delete_worktree_dialog(
     frame: &mut Frame,
@@ -22,8 +23,12 @@ pub fn render_delete_worktree_dialog(
 
     frame.render_widget(Clear, dialog_area);
 
+    let title = match dialog.backend {
+        VcsBackend::Jj => " Delete Workspace ",
+        VcsBackend::Git => " Delete Worktree ",
+    };
     let block = Block::default()
-        .title(" Delete Worktree ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red));
 
@@ -40,6 +45,11 @@ pub fn render_delete_worktree_dialog(
         return;
     };
 
+    let noun = match dialog.backend {
+        VcsBackend::Jj => "workspace",
+        VcsBackend::Git => "worktree",
+    };
+
     if dialog.is_deleting {
         let msg = Paragraph::new(Span::styled(
             format!("Deleting {}...", dialog.branch_name),
@@ -48,7 +58,7 @@ pub fn render_delete_worktree_dialog(
         frame.render_widget(msg, msg_area);
     } else {
         let msg = Paragraph::new(Line::from(vec![
-            Span::raw("Delete worktree "),
+            Span::raw(format!("Delete {} ", noun)),
             Span::styled(&dialog.branch_name, Style::default().fg(Color::White)),
             Span::raw("?"),
         ]));
