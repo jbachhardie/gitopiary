@@ -314,11 +314,7 @@ fn handle_add_repo_dialog_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender
 
 async fn validate_and_add_repo(path: std::path::PathBuf, tx: UnboundedSender<AppEvent>) {
     let result = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
-        if !path.exists() {
-            return Err(format!("Path does not exist: {}", path.display()));
-        }
-        git2::Repository::open(&path)
-            .map_err(|e| format!("Not a git repository: {}", e))?;
+        crate::vcs::validate_repo_path(&path)?;
         Ok(path)
     })
     .await;
@@ -511,7 +507,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent, tx: &UnboundedSender<AppEvent>)
                         repo_path: repo.config.path.clone(),
                         worktree_path: wt.path.clone(),
                         branch_name: wt.branch.clone(),
-                        backend: repo.backend,
+                        backend: wt.backend,
                         workspace_name: wt.name.clone(),
                         is_deleting: false,
                         error: None,

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use git2::{BranchType, Repository as GitRepo, StatusOptions};
 use crate::config::RepoConfig;
 use crate::state::types::{Repository, Worktree, WorktreeStatus};
+use crate::vcs::VcsBackend;
 use anyhow::{Context, Result};
 
 /// Fast first pass: open the repo just long enough to enumerate worktree paths.
@@ -53,6 +54,7 @@ pub fn load_worktree_info(path: PathBuf, is_main: bool) -> Result<Worktree> {
         is_main,
         status,
         pr: None,
+        backend: VcsBackend::Git,
     })
 }
 

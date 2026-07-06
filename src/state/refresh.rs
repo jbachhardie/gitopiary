@@ -5,7 +5,7 @@ use crate::config::{Config, RepoConfig};
 use crate::events::AppEvent;
 use crate::github::pr::fetch_prs;
 use crate::state::types::Repository;
-use crate::vcs::{self, VcsBackend};
+use crate::vcs;
 
 pub async fn run_refresh(config: Config, tx: UnboundedSender<AppEvent>) {
     let mut interval = tokio::time::interval(
@@ -43,12 +43,15 @@ async fn do_refresh(config: &Config, tx: &UnboundedSender<AppEvent>) {
 }
 
 async fn load_repo_streaming(config: RepoConfig, tx: UnboundedSender<AppEvent>) {
+    // Repo-level backend: only used as the default for NEW creation (the
+    // New Worktree dialog). Discovery itself unions both backends below, so
+    // existing worktrees/workspaces are never gated on this value.
     let backend = vcs::detect_backend(&config.path);
 
     // Phase 1: enumerate worktree paths — open the repo once, quickly.
     let config_for_list = config.clone();
     let sources = match tokio::task::spawn_blocking(move || {
-        vcs::list_worktree_paths(backend, &config_for_list)
+        vcs::list_worktree_paths(&config_for_list)
     })
     .await
     {
@@ -65,40 +68,31 @@ async fn load_repo_streaming(config: RepoConfig, tx: UnboundedSender<AppEvent>) 
     };
 
     // Phase 2: load each worktree's status.
-    let mut worktrees = match backend {
-        // git2 calls are independent per worktree, so run them in parallel,
-        // each on its own blocking thread.
-        VcsBackend::Git => {
-            let mut wt_set: JoinSet<anyhow::Result<crate::state::types::Worktree>> = JoinSet::new();
-            for source in sources {
-                wt_set.spawn_blocking(move || vcs::load_worktree_info(backend, source));
+    let mut worktrees = if vcs::needs_sequential_loading(&sources) {
+        let mut worktrees = vec![];
+        for source in sources {
+            let result = tokio::task::spawn_blocking(move || vcs::load_worktree_info(source)).await;
+            match result {
+                Ok(Ok(wt)) => worktrees.push(wt),
+                Ok(Err(e)) => tracing::warn!("Failed to load worktree status: {}", e),
+                Err(e) => tracing::warn!("Worktree thread error: {}", e),
             }
-            let mut worktrees = vec![];
-            while let Some(result) = wt_set.join_next().await {
-                match result {
-                    Ok(Ok(wt)) => worktrees.push(wt),
-                    Ok(Err(e)) => tracing::warn!("Failed to load worktree status: {}", e),
-                    Err(e) => tracing::warn!("Worktree thread error: {}", e),
-                }
-            }
-            worktrees
         }
-        // jj commands snapshot the working copy and take a repo-level lock,
-        // so sibling workspaces of the same repo are loaded sequentially to
-        // avoid lock-contention errors. Other repos still refresh
-        // concurrently via the outer JoinSet in do_refresh.
-        VcsBackend::Jj => {
-            let mut worktrees = vec![];
-            for source in sources {
-                let result = tokio::task::spawn_blocking(move || vcs::load_worktree_info(backend, source)).await;
-                match result {
-                    Ok(Ok(wt)) => worktrees.push(wt),
-                    Ok(Err(e)) => tracing::warn!("Failed to load worktree status: {}", e),
-                    Err(e) => tracing::warn!("Worktree thread error: {}", e),
-                }
-            }
-            worktrees
+        worktrees
+    } else {
+        let mut wt_set: JoinSet<anyhow::Result<crate::state::types::Worktree>> = JoinSet::new();
+        for source in sources {
+            wt_set.spawn_blocking(move || vcs::load_worktree_info(source));
         }
+        let mut worktrees = vec![];
+        while let Some(result) = wt_set.join_next().await {
+            match result {
+                Ok(Ok(wt)) => worktrees.push(wt),
+                Ok(Err(e)) => tracing::warn!("Failed to load worktree status: {}", e),
+                Err(e) => tracing::warn!("Worktree thread error: {}", e),
+            }
+        }
+        worktrees
     };
 
     // Keep main worktree first, then sort the rest alphabetically.

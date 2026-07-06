@@ -174,6 +174,12 @@ pub struct Worktree {
     pub is_main: bool,
     pub status: WorktreeStatus,
     pub pr: Option<PullRequest>,
+    /// Which backend actually owns this specific worktree/workspace. A
+    /// colocated repo can have both plain git worktrees (unknown to jj) and
+    /// jj workspaces (unknown to git) at once, so this is per-entry, not
+    /// inherited from `Repository.backend` (which only reflects what new
+    /// creations should default to).
+    pub backend: VcsBackend,
 }
 
 #[derive(Debug, Clone, Default)]

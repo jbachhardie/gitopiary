@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use crate::config::RepoConfig;
 use crate::state::types::{PrState, PullRequest, Repository, Worktree, WorktreeStatus};
+use crate::vcs::VcsBackend;
 
 // ---------------------------------------------------------------------------
 // Serialisable mirror types
@@ -15,6 +16,10 @@ pub struct Cache {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CachedRepo {
     pub path: PathBuf,
+    /// "git" | "jj". Optional so cache files written before jj support
+    /// existed still load cleanly.
+    #[serde(default)]
+    pub backend: Option<String>,
     pub worktrees: Vec<CachedWorktree>,
 }
 
@@ -29,6 +34,10 @@ pub struct CachedWorktree {
     pub behind: u32,
     pub is_dirty: bool,
     pub pr: Option<CachedPr>,
+    /// "git" | "jj", per-entry (a colocated repo can mix both). Optional so
+    /// cache files written before jj support existed still load cleanly.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +102,12 @@ pub fn hydrate_repo(config: RepoConfig, cache: &Cache) -> Repository {
 
     if let Some(cached) = cache.repos.iter().find(|r| r.path == config.path) {
         repo.worktrees = cached.worktrees.iter().map(cached_to_worktree).collect();
+        if let Some(backend) = &cached.backend {
+            repo.backend = match backend.as_str() {
+                "jj" => VcsBackend::Jj,
+                _ => VcsBackend::Git,
+            };
+        }
     }
 
     repo
@@ -111,6 +126,10 @@ fn cached_to_worktree(w: &CachedWorktree) -> Worktree {
             is_dirty: w.is_dirty,
         },
         pr: w.pr.as_ref().map(cached_to_pr),
+        backend: match w.backend.as_deref() {
+            Some("jj") => VcsBackend::Jj,
+            _ => VcsBackend::Git,
+        },
     }
 }
 
@@ -135,6 +154,10 @@ fn cached_to_pr(p: &CachedPr) -> PullRequest {
 fn repo_to_cached(repo: &Repository) -> CachedRepo {
     CachedRepo {
         path: repo.config.path.clone(),
+        backend: Some(match repo.backend {
+            VcsBackend::Git => "git",
+            VcsBackend::Jj => "jj",
+        }.to_string()),
         worktrees: repo.worktrees.iter().map(worktree_to_cached).collect(),
     }
 }
@@ -150,6 +173,10 @@ fn worktree_to_cached(w: &Worktree) -> CachedWorktree {
         behind: w.status.behind,
         is_dirty: w.status.is_dirty,
         pr: w.pr.as_ref().map(pr_to_cached),
+        backend: Some(match w.backend {
+            VcsBackend::Git => "git",
+            VcsBackend::Jj => "jj",
+        }.to_string()),
     }
 }
 

@@ -1,9 +1,22 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use crate::config::RepoConfig;
 use crate::state::types::{Worktree, WorktreeStatus};
-use crate::vcs::WorktreeSource;
+use crate::vcs::{VcsBackend, WorktreeSource};
 use super::cli::run_jj;
+
+pub fn is_jj_repo(path: &Path) -> bool {
+    path.join(".jj").exists()
+}
+
+/// Confirms `path` is a usable jj repo (not just a stale/corrupt `.jj` dir).
+/// Used once, on "Add Repo" submit — not on every refresh.
+pub fn validate_jj_repo(path: &Path) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    run_jj(&["-R", &path_str, "root"])
+        .with_context(|| format!("{:?} is not a usable jj repo", path))?;
+    Ok(())
+}
 
 /// Discover a jj repo's workspaces. `jj workspace list` reports names but not
 /// paths, so paths are derived by gitopiary's own creation convention
@@ -44,7 +57,7 @@ pub fn list_workspace_paths(config: &RepoConfig) -> Result<Vec<WorktreeSource>> 
             continue;
         }
 
-        sources.push(WorktreeSource { path: candidate, is_main, name: Some(name) });
+        sources.push(WorktreeSource { path: candidate, is_main, name: Some(name), backend: VcsBackend::Jj });
     }
 
     Ok(sources)
@@ -107,6 +120,7 @@ pub fn load_workspace_info(path: PathBuf, is_main: bool, name: String) -> Result
         is_main,
         status,
         pr: None,
+        backend: VcsBackend::Jj,
     })
 }
 
