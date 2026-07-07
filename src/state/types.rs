@@ -185,7 +185,15 @@ pub struct Worktree {
 #[derive(Debug, Clone, Default)]
 pub struct WorktreeStatus {
     pub uncommitted_changes: u32,
+    /// git: commits on this branch not on its upstream (need to push).
+    /// jj: commits on the current bookmark not on any of its remote-tracked
+    /// copies (also "need to push") — jj has no upstream-branch concept, so
+    /// this is computed against the bookmark's remote bookmarks instead.
     pub ahead: u32,
+    /// git: commits on the upstream not on this branch (need to pull).
+    /// jj: commits on `trunk()` not reachable from the current bookmark
+    /// ("need to rebase") — deliberately measured against trunk, not an
+    /// upstream, since that's the number a jj user actually cares about.
     pub behind: u32,
     pub is_dirty: bool,
 }
