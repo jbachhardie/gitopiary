@@ -43,12 +43,20 @@ pub fn validate_repo_path(path: &Path) -> Result<VcsBackend, String> {
 /// workspaces (created via `jj workspace add`, unknown to git) at the same
 /// time, so each discovered entry remembers which backend actually owns it.
 /// `name` is only meaningful for jj (the workspace name); git worktrees
-/// derive their name from the path's file name instead.
+/// derive their name from the path's file name instead. `repo_path` is the
+/// repo root (same as `path` for the main entry) — jj status queries other
+/// than the dirty-file count run against it rather than `path` directly, so
+/// they work even if a *secondary* jj workspace's own working copy is
+/// stale. `commit_id` (jj only) is that workspace's current commit, queried
+/// once from the repo-level `jj workspace list` (which doesn't require
+/// entering the workspace itself, so it's available even when stale).
 pub struct WorktreeSource {
     pub path: PathBuf,
     pub is_main: bool,
     pub name: Option<String>,
     pub backend: VcsBackend,
+    pub repo_path: PathBuf,
+    pub commit_id: Option<String>,
 }
 
 /// Discovers worktrees/workspaces for a repo by UNIONING both backends
@@ -66,11 +74,14 @@ pub fn list_worktree_paths(config: &RepoConfig) -> Result<Vec<WorktreeSource>> {
     let mut sources: Vec<WorktreeSource> = vec![];
 
     match crate::git::repo::list_worktree_paths(config) {
-        Ok(git_paths) => sources.extend(
-            git_paths
-                .into_iter()
-                .map(|(path, is_main)| WorktreeSource { path, is_main, name: None, backend: VcsBackend::Git }),
-        ),
+        Ok(git_paths) => sources.extend(git_paths.into_iter().map(|(path, is_main)| WorktreeSource {
+            path,
+            is_main,
+            name: None,
+            backend: VcsBackend::Git,
+            repo_path: config.path.clone(),
+            commit_id: None,
+        })),
         // A plain directory with no `.git` at all hits this too (expected,
         // silent) — but so would a real git2 failure on an actual git repo,
         // which must not vanish without a trace the way this whole fix is
@@ -85,6 +96,7 @@ pub fn list_worktree_paths(config: &RepoConfig) -> Result<Vec<WorktreeSource>> {
                     if let Some(existing) = sources.iter_mut().find(|s| paths_match(&s.path, &jj_source.path)) {
                         existing.backend = VcsBackend::Jj;
                         existing.name = jj_source.name;
+                        existing.commit_id = jj_source.commit_id;
                     } else {
                         sources.push(jj_source);
                     }
@@ -126,10 +138,16 @@ pub fn needs_sequential_loading(sources: &[WorktreeSource]) -> bool {
 pub fn load_worktree_info(source: WorktreeSource) -> Result<Worktree> {
     match source.backend {
         VcsBackend::Git => crate::git::repo::load_worktree_info(source.path, source.is_main),
+        // `commit_id` is always `Some` here: every `Jj`-tagged `WorktreeSource`
+        // is either constructed by `jj::repo::list_workspace_paths` (which
+        // always sets it) or upgraded from a `Git` entry during the merge in
+        // `list_worktree_paths`, which copies it over at the same time.
         VcsBackend::Jj => crate::jj::repo::load_workspace_info(
+            &source.repo_path,
             source.path,
             source.is_main,
             source.name.unwrap_or_default(),
+            source.commit_id.unwrap_or_default(),
         ),
     }
 }
@@ -183,7 +201,14 @@ mod tests {
     }
 
     fn source(path: &str, backend: VcsBackend) -> WorktreeSource {
-        WorktreeSource { path: PathBuf::from(path), is_main: false, name: None, backend }
+        WorktreeSource {
+            path: PathBuf::from(path),
+            is_main: false,
+            name: None,
+            backend,
+            repo_path: PathBuf::from(path),
+            commit_id: None,
+        }
     }
 
     #[test]

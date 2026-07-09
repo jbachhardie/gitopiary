@@ -7,13 +7,19 @@ use crate::github::pr::fetch_prs;
 use crate::state::types::Repository;
 use crate::vcs;
 
+/// Sends a `RefreshTick` every `refresh_interval_secs`, rather than running
+/// `do_refresh` itself — that keeps this timer subject to the same
+/// `is_refreshing` guard as an explicitly-triggered refresh (see
+/// `AppEvent::RefreshTick`'s doc comment for why that matters).
 pub async fn run_refresh(config: Config, tx: UnboundedSender<AppEvent>) {
     let mut interval = tokio::time::interval(
         std::time::Duration::from_secs(config.refresh_interval_secs),
     );
     loop {
         interval.tick().await;
-        do_refresh(&config, &tx).await;
+        if tx.send(AppEvent::RefreshTick).is_err() {
+            break;
+        }
     }
 }
 

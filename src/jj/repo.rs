@@ -22,17 +22,30 @@ pub fn validate_jj_repo(path: &Path) -> Result<()> {
 /// paths, so paths are derived by gitopiary's own creation convention
 /// (`<parent>/<name>`, `"default"` at the repo root) and then verified on
 /// disk; workspaces that don't verify are skipped with a warning, mirroring
-/// git::repo's tolerance for a `find_worktree` failure.
+/// git::repo's tolerance for a `find_worktree` failure. Each workspace's
+/// current commit id is captured here too (`target.commit_id()`), since
+/// `jj workspace list` is a repo-level query that works even for a
+/// workspace whose own working copy is stale — letting later status queries
+/// avoid ever needing to enter a stale workspace's directory (see
+/// `load_workspace_info`).
 pub fn list_workspace_paths(config: &RepoConfig) -> Result<Vec<WorktreeSource>> {
     let repo_path_str = config.path.to_string_lossy();
-    let stdout = run_jj(&["-R", &repo_path_str, "workspace", "list", "-T", "name ++ \"\\n\""])
-        .with_context(|| format!("Failed to list jj workspaces for {:?}", config.path))?;
+    // `--ignore-working-copy`: this only reads commit-graph/bookmark data,
+    // not file contents, and `-R config.path` is itself the "default"
+    // workspace's own directory by convention — without this flag, a stale
+    // *default* workspace would fail here and drop every jj workspace in
+    // the repo at once (worse than the single-workspace bug this is fixing).
+    let stdout = run_jj(&[
+        "-R", &repo_path_str, "--ignore-working-copy", "workspace", "list",
+        "-T", "name ++ \"\\t\" ++ target.commit_id() ++ \"\\n\"",
+    ])
+    .with_context(|| format!("Failed to list jj workspaces for {:?}", config.path))?;
 
-    let names = parse_workspace_names(&stdout);
+    let entries = parse_workspace_entries(&stdout);
     let parent = config.path.parent();
 
     let mut sources = vec![];
-    for name in names {
+    for (name, commit_id) in entries {
         let is_main = name == "default";
         let candidate = if is_main {
             config.path.clone()
@@ -57,33 +70,46 @@ pub fn list_workspace_paths(config: &RepoConfig) -> Result<Vec<WorktreeSource>> 
             continue;
         }
 
-        sources.push(WorktreeSource { path: candidate, is_main, name: Some(name), backend: VcsBackend::Jj });
+        sources.push(WorktreeSource {
+            path: candidate,
+            is_main,
+            name: Some(name),
+            backend: VcsBackend::Jj,
+            repo_path: config.path.clone(),
+            commit_id: Some(commit_id),
+        });
     }
 
     Ok(sources)
 }
 
-/// Parses `jj workspace list -T 'name ++ "\n"'` output, keeping only names
-/// safe to use as a path component and CLI argument. jj's template engine
-/// quotes names containing spaces (e.g. `"with space"`, quote characters
-/// included verbatim) rather than emitting them raw, and gitopiary never
-/// creates such names itself — so rather than replicate jj's quoting rules,
-/// anything outside a plain identifier is skipped. This also rejects a
-/// leading `-`, which `jj` CLI flags parse as an option, not a name.
-pub fn parse_workspace_names(stdout: &str) -> Vec<String> {
-    let mut names = vec![];
+/// Parses `jj workspace list -T 'name ++ "\t" ++ target.commit_id() ++ "\n"'`
+/// output into `(name, commit_id)` pairs, keeping only names safe to use as
+/// a path component and CLI argument. jj's template engine quotes names
+/// containing spaces (e.g. `"with space"`, quote characters included
+/// verbatim) rather than emitting them raw, and gitopiary never creates such
+/// names itself — so rather than replicate jj's quoting rules, anything
+/// outside a plain identifier is skipped. This also rejects a leading `-`,
+/// which `jj` CLI flags parse as an option, not a name. `commit_id` is a
+/// full hex commit id, always a safe bare revset symbol.
+pub fn parse_workspace_entries(stdout: &str) -> Vec<(String, String)> {
+    let mut entries = vec![];
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if is_safe_workspace_name(line) {
-            names.push(line.to_string());
+        let Some((name, commit_id)) = line.split_once('\t') else {
+            tracing::warn!("Skipping malformed jj workspace list line: {:?}", line);
+            continue;
+        };
+        if is_safe_workspace_name(name) {
+            entries.push((name.to_string(), commit_id.to_string()));
         } else {
-            tracing::warn!("Skipping jj workspace with unsupported name: {:?}", line);
+            tracing::warn!("Skipping jj workspace with unsupported name: {:?}", name);
         }
     }
-    names
+    entries
 }
 
 /// `/` is allowed (but validated per path segment) since slash-namespaced
@@ -104,30 +130,46 @@ pub(super) fn is_safe_workspace_name(name: &str) -> bool {
         })
 }
 
-/// Load a single workspace's status. Each call shells out to `jj` a handful
-/// of times against `path` directly (`-R <path>`, since revsets like `@`
-/// resolve relative to the target workspace).
-pub fn load_workspace_info(path: PathBuf, is_main: bool, name: String) -> Result<Worktree> {
-    let path_str = path.to_string_lossy().to_string();
+/// Load a single workspace's status. `repo_path`/`commit_id` (from the
+/// repo-level `jj workspace list`) drive the bookmark-label and
+/// rebase/push-status queries, so those work even if `workspace_path`'s own
+/// working copy is stale — only the uncommitted-changes count genuinely
+/// needs to operate "as" that specific workspace.
+pub fn load_workspace_info(
+    repo_path: &Path,
+    workspace_path: PathBuf,
+    is_main: bool,
+    name: String,
+    commit_id: String,
+) -> Result<Worktree> {
+    let repo_path_str = repo_path.to_string_lossy();
 
-    let (branch, bookmark) = load_branch_label(&path_str)?;
-    let status = load_status(&path_str, bookmark.as_deref());
+    let (branch, bookmark) = load_branch_label(&repo_path_str, &commit_id);
+    let (ahead, behind) = get_rebase_and_push_status(&repo_path_str, bookmark.as_deref());
+    let (uncommitted_changes, is_dirty) = load_dirty_status(&workspace_path.to_string_lossy());
 
     Ok(Worktree {
         name,
-        path,
+        path: workspace_path,
         branch,
         is_main,
-        status,
+        status: WorktreeStatus { uncommitted_changes, ahead, behind, is_dirty },
         pr: None,
         backend: VcsBackend::Jj,
     })
 }
 
-/// The nearest bookmark to `@` (also returned separately, since callers need
-/// it to compute rebase/push status), or a short change-id if none exists —
-/// the jj analog of git's "branch name, else short OID" fallback.
-fn load_branch_label(path_str: &str) -> Result<(String, Option<String>)> {
+/// The nearest bookmark to `commit_id` (also returned separately, since
+/// callers need it to compute rebase/push status), or a short commit id if
+/// none exists — the jj analog of git's "branch name, else short OID"
+/// fallback. Queried via `repo_path_str` (the repo root, always a valid `-R`
+/// target) rather than the specific workspace's own path, with
+/// `--ignore-working-copy` (this only reads commit-graph/bookmark data, not
+/// file contents), so this works even for a workspace whose working copy is
+/// stale — `commit_id` alone is enough to identify which commit to look at,
+/// and doubles as the no-bookmark fallback label with no further `jj` call
+/// needed, so there's no second failure mode to handle here.
+fn load_branch_label(repo_path_str: &str, commit_id: &str) -> (String, Option<String>) {
     // `bookmarks.join(",")` (rather than `.map(|b| b.name()).join(",")`)
     // would render each ref's default Display form, which appends a `*`
     // whenever the local bookmark differs from a tracked remote copy — the
@@ -135,26 +177,18 @@ fn load_branch_label(path_str: &str) -> Result<(String, Option<String>)> {
     // would otherwise corrupt both the displayed label and every downstream
     // revset that uses this name as a symbol.
     let bookmark_out = run_jj(&[
-        "-R", path_str,
+        "-R", repo_path_str, "--ignore-working-copy",
         "log", "--no-graph", "--limit", "1",
-        "-r", "heads(::@ & bookmarks())",
+        "-r", &format!("heads(::{commit_id} & bookmarks())"),
         "-T", "bookmarks.map(|b| b.name()).join(\",\") ++ \"\\n\"",
     ])
     .unwrap_or_default();
 
     if let Some(bookmark) = parse_bookmark_line(&bookmark_out) {
-        return Ok((bookmark.clone(), Some(bookmark)));
+        return (bookmark.clone(), Some(bookmark));
     }
 
-    let change_id_out = run_jj(&[
-        "-R", path_str,
-        "log", "--no-graph", "--limit", "1",
-        "-r", "@",
-        "-T", "change_id.short(8) ++ \"\\n\"",
-    ])
-    .with_context(|| format!("Failed to read @ for jj workspace at {}", path_str))?;
-
-    Ok((change_id_out.trim().to_string(), None))
+    (commit_id.chars().take(8).collect(), None)
 }
 
 /// Parses `jj log -T 'bookmarks.map(|b| b.name()).join(",") ++ "\n"'`
@@ -173,14 +207,27 @@ pub fn parse_bookmark_line(stdout: &str) -> Option<String> {
     Some(names[0].to_string())
 }
 
-fn load_status(path_str: &str, bookmark: Option<&str>) -> WorktreeStatus {
-    let uncommitted_changes = run_jj(&["-R", path_str, "diff", "-r", "@", "--summary", "--no-pager"])
-        .map(|out| count_nonblank_lines(&out))
-        .unwrap_or(0);
-    let is_dirty = uncommitted_changes > 0;
-    let (ahead, behind) = get_rebase_and_push_status(path_str, bookmark);
-
-    WorktreeStatus { uncommitted_changes, ahead, behind, is_dirty }
+/// Uncommitted-changes count for this specific workspace's on-disk state.
+/// Unlike the bookmark-label/rebase/push queries, this MUST operate "as"
+/// the workspace (`-R workspace_path_str`, `-r @`), since it needs jj to
+/// snapshot that workspace's actual files — which is exactly what a stale
+/// working copy (another workspace advanced the repo without this one
+/// being updated) refuses to do until `jj workspace update-stale` runs.
+/// Degrading to "nothing to report" rather than failing the whole worktree
+/// entry over this is deliberate: `jj workspace update-stale` mutates the
+/// workspace's files, so it's not something to run automatically from a
+/// background refresh — the user should have to opt into that.
+fn load_dirty_status(workspace_path_str: &str) -> (u32, bool) {
+    match run_jj(&["-R", workspace_path_str, "diff", "-r", "@", "--summary", "--no-pager"]) {
+        Ok(out) => {
+            let n = count_nonblank_lines(&out);
+            (n, n > 0)
+        }
+        Err(e) => {
+            tracing::warn!("Could not determine dirty status for jj workspace at {}: {}", workspace_path_str, e);
+            (0, false)
+        }
+    }
 }
 
 pub fn count_nonblank_lines(stdout: &str) -> u32 {
@@ -201,26 +248,42 @@ fn get_rebase_and_push_status(path_str: &str, bookmark: Option<&str>) -> (u32, u
     let Some(bookmark) = bookmark else { return (0, 0) };
     let bookmark = escape_revset_string(bookmark);
 
-    // Commits on the bookmark not reachable from any of its remote-tracked
-    // copies (unioned across every remote tracking this name) — "need to
-    // push". `root()` is unioned into the left side explicitly: without it,
-    // a bookmark that has never been pushed anywhere leaves
-    // `remote_bookmarks(...)` empty, which would otherwise count jj's
-    // synthetic root commit as part of the "unpushed" total too.
-    let ahead = run_jj(&[
-        "-R", path_str, "log", "--no-graph",
-        "-r", &format!("(remote_bookmarks(exact:\"{bookmark}\") | root())..bookmarks(exact:\"{bookmark}\")"),
-        "-T", "\"x\\n\"",
+    // "Need to push" only has a meaningful answer if this bookmark has
+    // actually been pushed under this exact name before. If it hasn't,
+    // `remote_bookmarks(...)` is empty, and "commits not reachable from any
+    // remote copy" would count the bookmark's ENTIRE ancestry back to
+    // root() — verified against a real repo, this can be 100,000+ commits
+    // for an old bookmark, a meaningless number to show. Treat "never
+    // pushed under this name" the same as "no bookmark at all" (0) rather
+    // than "all of history."
+    let has_remote = run_jj(&[
+        "-R", path_str, "--ignore-working-copy", "log", "--no-graph",
+        "-r", &format!("remote_bookmarks(exact:\"{bookmark}\")"), "-T", "\"x\\n\"",
     ])
-    .map(|out| count_nonblank_lines(&out))
-    .unwrap_or(0);
+    .map(|out| !out.trim().is_empty())
+    .unwrap_or(false);
+
+    let ahead = if has_remote {
+        run_jj(&[
+            "-R", path_str, "--ignore-working-copy", "log", "--no-graph",
+            "-r", &format!("remote_bookmarks(exact:\"{bookmark}\")..bookmarks(exact:\"{bookmark}\")"),
+            "-T", "\"x\\n\"",
+        ])
+        .map(|out| count_nonblank_lines(&out))
+        .unwrap_or(0)
+    } else {
+        0
+    };
 
     // Commits on `trunk()` not reachable from the bookmark — "need to
     // rebase". Any failure (including `trunk()` not resolving in a
     // brand-new repo with no bookmarks/remote) degrades to 0.
-    let behind = run_jj(&["-R", path_str, "log", "--no-graph", "-r", &format!("\"{bookmark}\"..trunk()"), "-T", "\"x\\n\""])
-        .map(|out| count_nonblank_lines(&out))
-        .unwrap_or(0);
+    let behind = run_jj(&[
+        "-R", path_str, "--ignore-working-copy", "log", "--no-graph",
+        "-r", &format!("\"{bookmark}\"..trunk()"), "-T", "\"x\\n\"",
+    ])
+    .map(|out| count_nonblank_lines(&out))
+    .unwrap_or(0);
 
     (ahead, behind)
 }
@@ -237,46 +300,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_workspace_names_multiple() {
+    fn parse_workspace_entries_multiple() {
         assert_eq!(
-            parse_workspace_names("default\nfeature-x\n"),
-            vec!["default".to_string(), "feature-x".to_string()]
+            parse_workspace_entries("default\tabc123\nfeature-x\tdef456\n"),
+            vec![("default".to_string(), "abc123".to_string()), ("feature-x".to_string(), "def456".to_string())]
         );
     }
 
     #[test]
-    fn parse_workspace_names_empty() {
-        assert_eq!(parse_workspace_names(""), Vec::<String>::new());
+    fn parse_workspace_entries_empty() {
+        assert_eq!(parse_workspace_entries(""), Vec::<(String, String)>::new());
     }
 
     #[test]
-    fn parse_workspace_names_skips_quoted_and_unsafe_names() {
+    fn parse_workspace_entries_skips_quoted_and_unsafe_names() {
         // jj quotes names containing spaces verbatim (quote chars included)
         // rather than emitting them raw; names starting with `-` would be
         // parsed as a CLI flag by `jj` itself. Both are skipped rather than
         // mis-parsed or passed through unsafely.
         assert_eq!(
-            parse_workspace_names("default\n\"with space\"\n-dashname\n"),
-            vec!["default".to_string()]
+            parse_workspace_entries("default\tabc123\n\"with space\"\tdef456\n-dashname\tghi789\n"),
+            vec![("default".to_string(), "abc123".to_string())]
         );
     }
 
     #[test]
-    fn parse_workspace_names_allows_slash_namespaced_names() {
+    fn parse_workspace_entries_allows_slash_namespaced_names() {
         // Slash-namespaced names (feature/login) are a normal git-branch
         // convention gitopiary's own workspace-creation flow will produce,
         // and jj emits them raw/unquoted — must not be dropped.
         assert_eq!(
-            parse_workspace_names("default\nfeature/login\n"),
-            vec!["default".to_string(), "feature/login".to_string()]
+            parse_workspace_entries("default\tabc123\nfeature/login\tdef456\n"),
+            vec![("default".to_string(), "abc123".to_string()), ("feature/login".to_string(), "def456".to_string())]
         );
     }
 
     #[test]
-    fn parse_workspace_names_rejects_dot_segments_in_slash_names() {
+    fn parse_workspace_entries_rejects_dot_segments_in_slash_names() {
         assert_eq!(
-            parse_workspace_names("default\nfeature/../escape\n"),
-            vec!["default".to_string()]
+            parse_workspace_entries("default\tabc123\nfeature/../escape\tdef456\n"),
+            vec![("default".to_string(), "abc123".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_workspace_entries_skips_malformed_line_without_tab() {
+        assert_eq!(
+            parse_workspace_entries("default\tabc123\nno-tab-here\n"),
+            vec![("default".to_string(), "abc123".to_string())]
         );
     }
 
@@ -314,6 +385,17 @@ mod tests {
             .is_ok()
     }
 
+    /// The current commit id of `@` in `repo_path_str`, for tests that call
+    /// `load_workspace_info` directly on a single-workspace repo (where the
+    /// workspace path and repo path are the same) without going through
+    /// `list_workspace_paths` first.
+    fn current_commit_id(repo_path_str: &str) -> String {
+        run_jj(&["-R", repo_path_str, "log", "--no-graph", "--limit", "1", "-r", "@", "-T", "commit_id ++ \"\\n\""])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
     #[test]
     fn discovers_default_workspace_in_a_fresh_jj_repo() {
         if !jj_available() {
@@ -336,7 +418,14 @@ mod tests {
         assert_eq!(sources[0].path, repo_path);
         assert_eq!(sources[0].name.as_deref(), Some("default"));
 
-        let wt = load_workspace_info(sources[0].path.clone(), sources[0].is_main, "default".to_string()).unwrap();
+        let wt = load_workspace_info(
+            &repo_path,
+            sources[0].path.clone(),
+            sources[0].is_main,
+            "default".to_string(),
+            sources[0].commit_id.clone().unwrap(),
+        )
+        .unwrap();
         assert!(wt.is_main);
         // Brand-new repo: no bookmarks anywhere — falls back to a change-id
         // label. Rebase/push status is scoped to a named bookmark, so with
@@ -359,13 +448,14 @@ mod tests {
         run_jj(&["git", "init", &repo_path_str]).unwrap();
         run_jj(&["-R", &repo_path_str, "bookmark", "create", "my-feature", "-r", "@"]).unwrap();
 
-        let wt = load_workspace_info(repo_path, true, "default".to_string()).unwrap();
+        let commit_id = current_commit_id(&repo_path_str);
+        let wt = load_workspace_info(&repo_path.clone(), repo_path, true, "default".to_string(), commit_id).unwrap();
         assert_eq!(wt.branch, "my-feature");
-        // Never pushed anywhere: the bookmark's one real commit is
-        // "unpushed" (remote_bookmarks() is empty), but root() itself must
-        // NOT be counted (it's excluded explicitly). trunk() falls back to
-        // root() so there's nothing to rebase onto.
-        assert_eq!((wt.status.ahead, wt.status.behind), (1, 0));
+        // Never pushed anywhere (no remote configured at all): "ahead"
+        // degrades to 0 rather than counting the bookmark's full ancestry
+        // back to root(). trunk() falls back to root() so there's nothing
+        // to rebase onto either.
+        assert_eq!((wt.status.ahead, wt.status.behind), (0, 0));
     }
 
     #[test]
@@ -468,13 +558,15 @@ mod tests {
         // publish a brand-new bookmark from a test with no existing config.
         run_jj(&["-R", &repo_path_str, "git", "push", "--bookmark", "feature", "--allow-new"]).unwrap();
 
-        let wt = load_workspace_info(repo_path.clone(), true, "default".to_string()).unwrap();
+        let commit_id = current_commit_id(&repo_path_str);
+        let wt = load_workspace_info(&repo_path.clone(), repo_path.clone(), true, "default".to_string(), commit_id).unwrap();
         assert_eq!(wt.status.ahead, 0, "freshly pushed bookmark should have nothing unpushed");
 
         run_jj(&["-R", &repo_path_str, "new", "-m", "local change"]).unwrap();
         run_jj(&["-R", &repo_path_str, "bookmark", "set", "feature", "-r", "@"]).unwrap();
 
-        let wt = load_workspace_info(repo_path, true, "default".to_string()).unwrap();
+        let commit_id = current_commit_id(&repo_path_str);
+        let wt = load_workspace_info(&repo_path.clone(), repo_path, true, "default".to_string(), commit_id).unwrap();
         assert_eq!(wt.status.ahead, 1, "one local commit not yet pushed to origin");
     }
 
@@ -504,7 +596,8 @@ mod tests {
         // (it's currently sitting on top of "main", the last bookmark moved).
         run_jj(&["-R", &repo_path_str, "edit", "feature"]).unwrap();
 
-        let wt = load_workspace_info(repo_path, true, "default".to_string()).unwrap();
+        let commit_id = current_commit_id(&repo_path_str);
+        let wt = load_workspace_info(&repo_path.clone(), repo_path, true, "default".to_string(), commit_id).unwrap();
         assert_eq!(wt.branch, "feature");
         assert_eq!(wt.status.behind, 1, "trunk (main) has one commit feature doesn't have");
     }
@@ -535,5 +628,31 @@ mod tests {
 
         let (ahead, behind) = get_rebase_and_push_status(&repo_path_str, Some(r#"weird"branch"#));
         assert_eq!((ahead, behind), (0, 0));
+    }
+
+    #[test]
+    fn dirty_status_degrades_gracefully_when_workspace_query_fails() {
+        // Regression test: a real jj workspace can go "stale" (its working
+        // copy hasn't caught up with operations made from a sibling
+        // workspace of the same repo), at which point `jj diff -r @` in
+        // that workspace refuses to run until `jj workspace update-stale`
+        // is used — gitopiary must not run that itself (it can rewrite
+        // on-disk files) nor let the whole worktree entry disappear over
+        // it. Reproducing jj's exact staleness heuristic in a fast test
+        // proved impractical; this exercises the same failure contract
+        // (the underlying `jj` invocation errors) via a path that's simply
+        // not a jj repo at all, which errors the same way structurally.
+        // Verified separately, by hand, against a real stale workspace that
+        // a user hit in production: this produces `(0, false)` there too,
+        // restoring the workspace's visibility instead of it vanishing.
+        if !jj_available() {
+            eprintln!("skipping: jj not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_repo = dir.path().join("not-a-repo");
+        std::fs::create_dir(&not_a_repo).unwrap();
+
+        assert_eq!(load_dirty_status(&not_a_repo.to_string_lossy()), (0, false));
     }
 }

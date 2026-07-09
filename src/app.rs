@@ -294,6 +294,12 @@ impl App {
                 // Redraw to update idle indicators, but only when sessions exist.
                 self.pty_manager.has_any_sessions()
             }
+            AppEvent::RefreshTick => {
+                // See AppEvent::RefreshTick's doc comment for why this goes
+                // through trigger_refresh rather than refreshing directly.
+                self.trigger_refresh(tx.clone());
+                false
+            }
             AppEvent::Quit => {
                 self.state.should_quit = true;
                 false

@@ -194,3 +194,40 @@ fn pr_to_cached(p: &PullRequest) -> CachedPr {
         url: p.url.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wt(name: &str) -> Worktree {
+        Worktree {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/repo/{name}")),
+            branch: "some-branch".to_string(),
+            is_main: name == "default",
+            status: WorktreeStatus { uncommitted_changes: 0, ahead: 0, behind: 14, is_dirty: false },
+            pr: None,
+            backend: VcsBackend::Jj,
+        }
+    }
+
+    #[test]
+    fn repo_to_cached_round_trips_every_worktree_through_json() {
+        let repo = Repository {
+            config: RepoConfig { path: PathBuf::from("/repo"), name: None },
+            display_name: "repo".to_string(),
+            worktrees: vec![wt("default"), wt("boop"), wt("pomni")],
+            is_expanded: true,
+            backend: VcsBackend::Jj,
+        };
+
+        let cache = Cache { repos: vec![repo_to_cached(&repo)] };
+        let json = serde_json::to_vec_pretty(&cache).unwrap();
+        let round_tripped: Cache = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(
+            round_tripped.repos[0].worktrees.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
+            vec!["default", "boop", "pomni"]
+        );
+    }
+}
